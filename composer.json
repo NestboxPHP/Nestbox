@@ -1,0 +1,17 @@
+{
+  "name": "nestboxphp/nestbox",
+  "description": "A interface for databases using PHP Data Objects written to easily fill gaps of niche requirements.",
+  "type": "library",
+  "license": "AGPL-3.0",
+  "autoload": {
+    "psr-4": {
+      "NestboxPHP\\Nestbox\\": "src/"
+    }
+  },
+  "minimum-stability": "stable",
+  "require": {
+    "ext-pdo": "*",
+    "ext-openssl": "*",
+    "ext-curl": "*"
+  }
+}
