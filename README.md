@@ -27,3 +27,5 @@ try {
 # References
 Since this was a project designed for learning, here are some great references used during the creation of this project:
 - [(The only proper) PDO tutorial](https://phpdelusions.net/pdo)
+- [Roll your own PDO PHP Class](http://culttt.com/2012/10/01/roll-your-own-pdo-php-class/)
+- [Why You Should Be Using PHP's PDO for Database Access](http://code.tutsplus.com/tutorials/why-you-should-be-using-phps-pdo-for-database-access--net-12059)
