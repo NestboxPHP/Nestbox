@@ -35,7 +35,7 @@ use NestboxPHP\Nestbox\Exception\TransactionRollbackFailedException;
 
 class Nestbox
 {
-    protected const string PACKAGE_NAME = 'nestbox';
+    protected const PACKAGE_NAME = 'nestbox';
 
     // connection properties
     protected string $host = 'localhost';
@@ -49,7 +49,7 @@ class Nestbox
     protected array $tableSchema = [];
     protected array $triggerSchema = [];
 
-    public const string nestbox_settings_table = 'nestbox_settings';
+    public const nestbox_settings_table = 'nestbox_settings';
 
     use MiscellaneousFunctionsTrait;
 
@@ -154,7 +154,6 @@ class Nestbox
         foreach (get_class_methods($this) as $methodName) {
             if (preg_match('/^create_class_table_(\w+)$/', $methodName, $matches)) {
                 if (!$this->valid_schema($matches[1])) $this->create_class_tables();
-                return;
             }
         }
     }
@@ -170,6 +169,7 @@ class Nestbox
         foreach (get_class_methods($this) as $methodName) {
             if (str_starts_with(haystack: $methodName, needle: "create_class_table_")) $this->$methodName();
         }
+        $this->load_table_schema(forceReload: true);
     }
 
 
@@ -704,7 +704,7 @@ class Nestbox
         if (!$this->valid_schema($table)) throw new InvalidTableException(table: $table);
 
         // verify params
-        if (empty($params)) throw new EmptyParamsException("Cannot insert empty data into table.");
+        if (empty($rows)) throw new EmptyParamsException("Cannot insert empty data into table.");
         if (!is_array(current($rows))) $rows = [$rows];
 
         $values = [];
@@ -726,7 +726,7 @@ class Nestbox
                 $vals[] = ":{$column}_$i";
             }
 
-            $values[] = implode(". ", $vals);
+            $values[] = implode(", ", $vals);
         }
 
         // populate updates array
