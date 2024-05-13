@@ -71,22 +71,24 @@ class Nestbox
         // start session if unstarted
         if (PHP_SESSION_ACTIVE !== session_status()) session_start();
 
-        $this->host = $host;
-        $this->user = $user;
-        $this->pass = $pass;
-        $this->name = $name;
+        // define new constants for future calls
+        if ($host && !defined('NESTBOX_DB_HOST')) define('NESTBOX_DB_HOST', $host);
+        if ($user && !defined('NESTBOX_DB_USER')) define('NESTBOX_DB_USER', $user);
+        if ($pass && !defined('NESTBOX_DB_PASS')) define('NESTBOX_DB_PASS', $pass);
+        if ($name && !defined('NESTBOX_DB_NAME')) define('NESTBOX_DB_NAME', $name);
 
-        // default overrides with defined environment constants
-        if (!$host && defined(constant_name: 'NESTBOX_DB_HOST')) $this->host = constant(name: 'NESTBOX_DB_HOST');
-        if (!$user && defined(constant_name: 'NESTBOX_DB_USER')) $this->user = constant(name: 'NESTBOX_DB_USER');
-        if (!$pass && defined(constant_name: 'NESTBOX_DB_PASS')) $this->pass = constant(name: 'NESTBOX_DB_PASS');
-        if (!$name && defined(constant_name: 'NESTBOX_DB_NAME')) $this->name = constant(name: 'NESTBOX_DB_NAME');
+        // null and undefined values mean missing data
+        if (is_null($host) && !defined('NESTBOX_DB_HOST')) throw new MissingDatabaseHostException();
+        if (is_null($user) && !defined('NESTBOX_DB_USER')) throw new MissingDatabaseUserException();
+        if (is_null($pass) && !defined('NESTBOX_DB_PASS')) throw new MissingDatabasePassException();
+        if (is_null($name) && !defined('NESTBOX_DB_NAME')) throw new MissingDatabaseNameException();
 
-        // manual overrides for new or invoked instantiations
-        if (!$this->host) throw new MissingDatabaseHostException();
-        if (!$this->user) throw new MissingDatabaseUserException();
-        if (!$this->pass) throw new MissingDatabasePassException();
-        if (!$this->name) throw new MissingDatabaseNameException();
+        // manual overrides take precedence for new or invoked instantiations, otherwise use constants
+        $this->host = ($host) ?: NESTBOX_DB_HOST;
+        $this->user = ($user) ?: NESTBOX_DB_USER;
+        $this->pass = ($pass) ?: NESTBOX_DB_PASS;
+        $this->name = ($name) ?: NESTBOX_DB_NAME;
+
 
         // make sure class tables have been created
         $this->check_class_tables();
@@ -303,10 +305,14 @@ class Nestbox
     protected function prep(string $query, array $params = []): bool
     {
         // prepare a statement without parameters
-        if (empty($params)) return $this->stmt = $this->pdo->prepare($query);
+        if (empty($params)) {
+            if ($this->stmt = $this->pdo->prepare($query)) return true;
+            return false;
+        }
 
         // prepare a statement with parameters
-        return $this->stmt = $this->pdo->prepare($query, $params);
+        if ($this->stmt = $this->pdo->prepare($query, $params)) return true;
+        return false;
     }
 
 
@@ -396,6 +402,7 @@ class Nestbox
     {
         $output = [];
         preg_match_all('/:(\w+)/', $query, $queryParams);
+        $queryParams = $queryParams[1];
 
         foreach ($params as $key => $value) {
             // verify parameter is in query
@@ -405,7 +412,8 @@ class Nestbox
             if (!$key = self::valid_schema_string($key)) continue;
 
             // remove found parameter from missing results
-            if ($position = array_search(trim($key, ":"), $queryParams)) {
+            $position = array_search(trim($key, ":"), $queryParams);
+            if (false !== $position) {
                 unset($queryParams[$position]);
                 $queryParams = array_values($queryParams);
             }
@@ -414,7 +422,7 @@ class Nestbox
         }
 
         // oh no, we forgot to pass one or more parameters!
-        if ($queryParams) throw new MissingParametersException(implode(", ", $queryParams));
+        if ($queryParams) throw new MissingParametersException($query . json_encode($queryParams));
 
         return $output;
     }
