@@ -428,6 +428,12 @@ class Nestbox
     }
 
 
+    public static function validate_order(string $order): string
+    {
+        return (in_array(strtoupper($order), ["ASC", "DESC"])) ? strtoupper($order) : "ASC";
+    }
+
+
     /**
      * Ensures the conjunction provided for *WHERE* clause is *AND* or *OR*, otherwise returns *AND*
      *
@@ -442,7 +448,7 @@ class Nestbox
 
     /**
      * Generates an array of column names from a given list of parameters by using the keys of the first element in a
-     * multi-dimensional array, or the keys of all elements in a flat array
+     * multidimensional array, or the keys of all elements in a flat array
      *
      * @param array $params
      * @return array [col_name_1, col_name_2, ...]
@@ -809,12 +815,16 @@ class Nestbox
      * @param string $conjunction can be "AND" or "OR", case-insensitive
      * @param int $start
      * @param int $limit
+     * @param array $orderBy
      * @return array|bool
      */
     public function select(string $table, array $where = [], string $conjunction = "AND", int $start = 0,
-                           int    $limit = 0): array|bool
+                           int    $limit = 0, array $orderBy = []): array|bool
     {
         if (!$this->valid_schema($table)) throw new InvalidTableException(table: $table);
+
+        // generate select clause
+        $selectClause = "SELECT * FROM `$table`";
 
         // generate where clause
         $whereClause = [];
@@ -827,11 +837,21 @@ class Nestbox
         }
         $whereClause = ($params) ? "WHERE " . implode($this::validate_conjunction($conjunction), $whereClause) : "";
 
+        // generate order by clause
+        $orderByClause = [];
+        foreach ($orderBy as $column => $order) {
+            if (!$this->valid_schema($table, $column)) throw new InvalidColumnException(table: $table, column: $column);
+            $orderByClause[] = $column ." ". $this::validate_order($order);
+        }
+        $orderByClause = ($orderByClause) ? "ORDER BY " . implode(", ", $orderByClause) : "";
+
         // generate limit clause
         $limitClause = ($limit) ? ($start) ? "LIMIT $start, $limit" : "LIMIT $limit" : "";
 
         // execute and get results
-        if (!$this->query_execute("SELECT * FROM `$table` $whereClause $limitClause;", $params)) return false;
+        if (!$this->query_execute("$selectClause $whereClause $orderByClause $limitClause;", $params)) {
+            return false;
+        }
         return $this->fetch_all_results();
     }
 
