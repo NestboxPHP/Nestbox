@@ -1,13 +1,15 @@
 {
-    "name": "nestboxphp/nestbox",
-    "description": "A PHP Data Objects (PDO) wrapper class for databases manipulations",
-    "type": "library",
-    "license": "AGPL-3.0",
-    "autoload": {
-        "psr-4": {
-            "NestboxPHP\\Nestbox\\": "src/"
-        }
-    },
-    "minimum-stability": "beta",
-    "require": {}
+  "name": "nestboxphp/nestbox",
+  "description": "A PHP Data Objects (PDO) wrapper class for databases manipulations.",
+  "type": "library",
+  "require": {
+  },
+  "require-dev": {
+  },
+  "license": "AGPL-3.0",
+  "autoload": {
+    "psr-4": {
+      "NestboxPHP\\Nestbox\\": "src/"
+    }
+  }
 }
