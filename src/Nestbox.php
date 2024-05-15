@@ -607,7 +607,7 @@ class Nestbox
             $matches = [$columnWithOperator, self::valid_schema_string($columnWithOperator), "="];
         }
 
-        if (!in_array(strtoupper($matches[2]), ["=", ">", "<", ">=", "<=", "<>", "!=", "BETWEEN", "LIKE", "IN"])) {
+        if (!in_array(strtoupper($matches[2]), ["=", ">", "<", ">=", "<=", "<>", "!=", "BETWEEN", "LIKE", "IN", "IS", "IS NOT"])) {
             throw new InvalidWhereOperator($matches[2]);
         }
 
@@ -631,9 +631,9 @@ class Nestbox
      *
      * @return array|false
      */
-    public function fetch_all_results(): array|false
+    public function fetch_all_results(int $fetchMode = PDO::FETCH_ASSOC): array|false
     {
-        return $this->stmt->fetchAll();
+        return $this->stmt->fetchAll($fetchMode);
     }
 
 
@@ -642,9 +642,9 @@ class Nestbox
      *
      * @return array|false
      */
-    public function fetch_first_result(): array|false
+    public function fetch_first_result(int $fetchMode = PDO::FETCH_ASSOC): array|false
     {
-        return $this->stmt->fetchAll()[0] ?? false;
+        return $this->stmt->fetchAll($fetchMode)[0] ?? false;
     }
 
 
@@ -653,9 +653,9 @@ class Nestbox
      *
      * @return array|false
      */
-    public function fetch_next_result(): array|false
+    public function fetch_next_result(int $fetchMode = PDO::FETCH_ASSOC): array|false
     {
-        return $this->stmt->fetch();
+        return $this->stmt->fetch($fetchMode);
     }
 
 
@@ -794,8 +794,8 @@ class Nestbox
             $whereClause[] = "`$column` $operator :$whereKey";
             $whereParams[$whereKey] = $value;
         }
-        $whereClause = ($whereParams) 
-            ? "WHERE " . implode($this::validate_conjunction($conjunction), $whereClause) : "";
+        $whereClause = (!$whereParams) ? ""
+            : "WHERE " . implode(" ". $this::validate_conjunction($conjunction) ." ", $whereClause);
 
         // aggregate and execute query
         $sql = (!$whereClause) ? "UPDATE `$table` SET $setClause;" : "UPDATE `$table` SET $setClause $whereClause;";
@@ -835,7 +835,8 @@ class Nestbox
             $whereClause[] = "`$column` $operator :$column";
             $params[$column] = $value;
         }
-        $whereClause = ($params) ? "WHERE " . implode($this::validate_conjunction($conjunction), $whereClause) : "";
+        $whereClause = (!$params) ? ""
+            : "WHERE " . implode(" ". $this::validate_conjunction($conjunction) ." ", $whereClause);
 
         // generate order by clause
         $orderByClause = [];
@@ -884,7 +885,8 @@ class Nestbox
             $whereClause[] = "`$column` $operator :$column";
             $params[$column] = $value;
         }
-        $whereClause = ($params) ? "WHERE " . implode($this::validate_conjunction($conjunction), $whereClause) : "";
+        $whereClause = (!$params) ? ""
+            : "WHERE " . implode(" ". $this::validate_conjunction($conjunction) ." ", $whereClause);
 
         if (!$this->query_execute("DELETE FROM $table $whereClause;", $params)) return false;
 
