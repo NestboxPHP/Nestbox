@@ -48,6 +48,7 @@ class Nestbox
 
     protected array $tableSchema = [];
     protected array $triggerSchema = [];
+    protected array $generatedColumns = [];
 
     public const nestbox_settings_table = 'nestbox_settings';
 
@@ -330,7 +331,7 @@ class Nestbox
     {
         // set binding type
         $type = Nestbox::get_parameter_pdo_type($value);
-        if (!$type) throw new InvalidParameterValueType("$variable => ($type) $value");
+        if (false === $type) throw new InvalidParameterValueType("$variable => $value");
 
         // backwards compatibility or whatever
         $variable = (!str_starts_with($variable, ':')) ? ":$variable" : $variable;
@@ -710,24 +711,31 @@ class Nestbox
         if (!$this->valid_schema($table)) throw new InvalidTableException(table: $table);
 
         // verify params
-        if (empty($rows)) throw new EmptyParamsException("Cannot insert empty data into table.");
+        if (empty($rows)) throw new EmptyParamsException("Cannot insert empty data into table $table.");
         if (!is_array(current($rows))) $rows = [$rows];
 
         $values = [];
         $params = [];
         $update = [];
-        $columns = array_keys(current($rows));
+        $columns = [];
+
+        // populate columns array
+        foreach (current($rows) as $column => $value) {
+            if (!$this->valid_schema($table, $column)) throw new InvalidColumnException(table: $table, column: $column);
+            if ($this->is_generated_column($table, $column)) continue;
+            $columns[] = $column;
+        }
 
         // populate values and params arrays
         foreach ($rows as $i => $row) {
-            if ($columns != array_keys($row)) {
-                throw new MismatchedColumnNamesException(array1: $columns, array2: array_keys($row));
-            }
-
             $vals = [];
 
             foreach ($row as $column => $value) {
-                if (!$this->valid_schema($table, $column)) throw new InvalidColumnException(table: $table, column: $column);
+                if ($this->is_generated_column($table, $column)) continue;
+                if (!in_array($column, $columns)) {
+                    throw new MismatchedColumnNamesException(array1: $columns, array2: array_keys($row));
+                }
+
                 $params["{$column}_$i"] = $value;
                 $vals[] = ":{$column}_$i";
             }
@@ -770,6 +778,8 @@ class Nestbox
         $setParams = [];
         foreach ($updates as $column => $value) {
             if (!$this->valid_schema($table, $column)) throw new InvalidColumnException(table: $table, column: $column);
+            if ($this->is_generated_column($table, $column)) continue;
+
             $setClause[] = "`$column` = :$column";
             $setParams[$column] = $value;
         }
@@ -1107,7 +1117,7 @@ class Nestbox
     {
         if ($this->tableSchema and !$forceReload) return true;
 
-        $sql = "SELECT `TABLE_NAME`,`COLUMN_NAME`,`DATA_TYPE`
+        $sql = "SELECT `TABLE_NAME`,`COLUMN_NAME`,`DATA_TYPE`,`GENERATION_EXPRESSION`
                 FROM `INFORMATION_SCHEMA`.`COLUMNS`
                 WHERE `TABLE_SCHEMA` = :database_name;";
 
@@ -1117,6 +1127,7 @@ class Nestbox
 
         foreach ($this->fetch_all_results() as $row) {
             $this->tableSchema[$row['TABLE_NAME']][$row['COLUMN_NAME']] = $row['DATA_TYPE'];
+            if ($row['GENERATION_EXPRESSION']) $this->generatedColumns[$row['TABLE_NAME']][] = $row['COLUMN_NAME'];
         }
 
         return true;
@@ -1224,6 +1235,17 @@ class Nestbox
         // return primary key
         if (!$this->query_execute($sql)) return "";
         return $this->fetch_first_result()["Column_name"];
+    }
+
+
+    public function table_schema(): array
+    {
+        return $this->tableSchema;
+    }
+
+    public function is_generated_column(string $table, string $column): bool
+    {
+        return in_array($column, $this->generatedColumns[$table] ?? []);
     }
 
 
@@ -1500,11 +1522,7 @@ class Nestbox
     {
         if (!$this->valid_schema($table)) throw new InvalidTableException(table: $table);
 
-        if (is_string($data)) {
-            if (!json_validate($data)) throw new MalformedJsonException;
-
-            $data = json_decode($data, associative: true);
-        }
+        if (is_string($data)) if (!$data = json_decode($data, associative: true)) throw new MalformedJsonException;
 
         if ($truncate) $this->truncate_table($table);
 
@@ -1520,20 +1538,21 @@ class Nestbox
      * @param bool $truncate
      * @return int
      */
-    public function load_database(string|array $input, bool $truncate = false): int
+    public function load_database(string|array $input, bool $truncate = false): array
     {
         $updateCount = 0;
+        $errors = [];
 
-        if (is_string($input)) {
-            if (!json_validate($input)) throw new MalformedJsonException;
-
-            $input = json_decode($input, associative: true);
-        }
+        if (is_string($input)) if (!$input = json_decode($input, associative: true)) throw new MalformedJsonException;
 
         foreach ($input as $table => $data) {
-            $updateCount += $this->load_table(table: $table, data: $data, truncate: $truncate);
+            try {
+                $updateCount += $this->load_table(table: $table, data: $data, truncate: $truncate);
+            } catch (EmptyParamsException $e) {
+                $errors[] = $e->getMessage();
+            }
         }
 
-        return $updateCount;
+        return [$updateCount, $errors];
     }
 }
