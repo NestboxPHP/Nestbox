@@ -50,7 +50,7 @@ class Nestbox
     protected array $triggerSchema = [];
     protected array $generatedColumns = [];
 
-    public const nestbox_settings_table = 'nestbox_settings';
+    public const NESTBOX_SETTINGS_TABLE = 'nestbox_settings';
 
     use MiscellaneousFunctionsTrait;
 
@@ -1279,23 +1279,24 @@ class Nestbox
     }
 
 
+    public function get_settings(string $package = null): array
+    {
+        $where = ($package) ? ['package_name' => $package] : [];
+
+        $settings = $this->select(table: $this::NESTBOX_SETTINGS_TABLE, where: $where);
+
+        return $this->parse_settings($settings);
+    }
+
+
     /**
      * Loads settings from the settings table
      *
      * @return array
      */
-    public function load_settings(): array
+    public function load_settings(string $package = null): array
     {
-        $where = ['package_name' => self::PACKAGE_NAME];
-
-        try {
-            $settings = $this->parse_settings($this->select(table: $this::nestbox_settings_table, where: $where));
-        } catch (InvalidTableException) {
-            var_dump("creating settings table", $this->create_class_table_nestbox_settings());
-            $this->load_table_schema();
-            $this->parse_settings($this->select(table: $this::nestbox_settings_table, where: $where));
-        }
-
+        $settings = $this->get_settings($package);
 
         foreach ($settings as $name => $value) {
             if (property_exists($this, $name)) {
@@ -1314,11 +1315,12 @@ class Nestbox
      * @param string $value
      * @return bool
      */
-    public function update_setting(string $name, string $value): bool
+    public function update_setting(string $name, mixed $value): bool
     {
         if (!property_exists($this, $name)) return false;
 
-        $this->$name = $value;
+        $type = $this->parse_setting_type($value);
+        $this->$name = $this->setting_type_conversion($type, $value);
 
         return true;
     }
@@ -1329,32 +1331,26 @@ class Nestbox
      *
      * @return void
      */
-    public function save_settings(): void
+    public function save_settings(string $package = null): int|bool
     {
-        $sql = "INSERT INTO `nestbox_settings` (
-                    `package_name`, `setting_name`, `setting_type`, `setting_value`
-                ) VALUES (
-                    :package_name, :setting_name, :setting_type, :setting_value
-                ) ON DUPLICATE KEY UPDATE
-                    `package_name` = :package_name,
-                    `setting_name` = :setting_name,
-                    `setting_type` = :setting_type,
-                    `setting_value` = :setting_value;";
+        $package = ($package) ?: self::PACKAGE_NAME;
+
+        $saves = 0;
+        $settings = [];
 
         foreach (get_class_vars(get_class($this)) as $name => $value) {
-            if (!str_starts_with($name, needle: self::PACKAGE_NAME)) {
-                continue;
-            }
+            if (!str_starts_with($name, needle: $package)) continue;
 
-            $params = [
-                "package_name" => self::PACKAGE_NAME,
+            $settings[] = [
+                "package_name" => $package,
                 "setting_name" => $name,
                 "setting_type" => $this->parse_setting_type($value),
                 "setting_value" => strval($value),
             ];
 
-            $this->query_execute($sql, $params);
         }
+
+        return ($settings) ? $this->insert($this::NESTBOX_SETTINGS_TABLE, $settings) : false;
     }
 
 
@@ -1368,7 +1364,10 @@ class Nestbox
     {
         $output = [];
         foreach ($settings as $setting) {
-            $output[$setting['setting_name']] = $this->setting_type_conversion(type: $setting['setting_type'], value: $setting['setting_value']);
+            $type = $setting['setting_type'];
+            $value = $setting['setting_value'];
+            $parsed = $this->setting_type_conversion($type, $value);
+            $output[$setting['setting_name']] = $parsed;
         }
         return $output;
     }
@@ -1382,11 +1381,11 @@ class Nestbox
      */
     protected function parse_setting_type(int|float|bool|array|string $setting): string
     {
-        if (is_int($setting)) return "string";
+        if (is_int($setting)) return "integer";
         if (is_float($setting)) return "float";
         if (is_bool($setting)) return "boolean";
         if (is_array($setting)) return "array";
-        if (json_validate($setting)) return "json";
+        if (json_decode($setting)) return "json";
         return "string";
     }
 
@@ -1398,9 +1397,9 @@ class Nestbox
      * @param string $value
      * @return int|float|bool|array|string
      */
-    protected function setting_type_conversion(string $type, string $value): int|float|bool|array|string
+    protected function setting_type_conversion(string $type, int|float|bool|array|string $value): int|float|bool|array|string
     {
-        if ("int" == strtolower($type)) {
+        if (in_array(strtolower($type), ["integer", "int"])) {
             return intval($value);
         }
 
@@ -1408,7 +1407,7 @@ class Nestbox
             return floatval($value);
         }
 
-        if ("bool" == strtolower($type)) {
+        if (in_array(strtolower($type), ["bool", "boolean"])) {
             return boolval($value);
         }
 
