@@ -35,7 +35,9 @@ use NestboxPHP\Nestbox\Exception\TransactionRollbackFailedException;
 
 class Nestbox
 {
-    protected const PACKAGE_NAME = 'nestbox';
+    public const PACKAGE_NAME = 'nestbox';
+    public const NESTBOX_SETTINGS_TABLE = 'nestbox_settings';
+    public const NESTBOX_ERROR_TABLE = 'nestbox_errors';
 
     // connection properties
     protected string $host = 'localhost';
@@ -49,8 +51,6 @@ class Nestbox
     protected array $tableSchema = [];
     protected array $triggerSchema = [];
     protected array $generatedColumns = [];
-
-    public const NESTBOX_SETTINGS_TABLE = 'nestbox_settings';
 
     use MiscellaneousFunctionsTrait;
 
@@ -111,7 +111,7 @@ class Nestbox
     public function __invoke(string $host = null, string $user = null, string $pass = null, string $name = null): void
     {
         // save settings
-        $this->save_settings();
+        $this->save_settings(static::PACKAGE_NAME);
 
         // close any existing database connection
         $this->close();
@@ -127,7 +127,7 @@ class Nestbox
     public function __destruct()
     {
         // save settings
-        $this->save_settings();
+        $this->save_settings(static::PACKAGE_NAME);
 
         // close any existing database connection
         $this->close();
@@ -771,6 +771,20 @@ class Nestbox
      */
     public function update(string $table, array $updates, array $where = [], string $conjunction = "AND"): int|bool
     {
+        /**
+         * It's possible to update multiple rows at once using the following style of query, although this could take
+         * some significant work to implement:
+         *
+         * UPDATE my_table
+         * SET value_to_update =
+         *     CASE
+         *         WHEN id = 1 THEN 'New Value 1'
+         *         WHEN id = 2 THEN 'New Value 2'
+         *         WHEN id = 3 THEN 'New Value 3'
+         *         ELSE value_to_update  -- Keep existing value for other rows
+         *     END
+         * WHERE id IN (1, 2, 3);
+         */
         if (!$this->valid_schema($table)) throw new InvalidTableException(table: $table);
 
         // generate set clause
@@ -778,7 +792,14 @@ class Nestbox
         $setParams = [];
         foreach ($updates as $column => $value) {
             if (!$this->valid_schema($table, $column)) throw new InvalidColumnException(table: $table, column: $column);
+            // generated columns are valid schema but cannot be set
             if ($this->is_generated_column($table, $column)) continue;
+            if ($this->table_primary_key($table) == $column) {
+                if (in_array($column, $where))
+                    throw new NestboxException("Can't set primary key while it is also in the where clause.");
+                $where[$column] = $value;
+                continue;
+            }
 
             $setClause[] = "`$column` = :$column";
             $setParams[$column] = $value;
@@ -800,7 +821,7 @@ class Nestbox
                     $whereKey = "where_{$column}_" . bin2hex(random_bytes(10));
                 }
             }
-            
+
             $whereClause[] = "`$column` $operator :$whereKey";
             $whereParams[$whereKey] = $value;
         }
@@ -809,6 +830,7 @@ class Nestbox
 
         // aggregate and execute query
         $sql = (!$whereClause) ? "UPDATE `$table` SET $setClause;" : "UPDATE `$table` SET $setClause $whereClause;";
+
         if (!$this->query_execute($sql, array_merge($setParams, $whereParams))) return false;
 
         return $this->get_row_count();
@@ -1267,7 +1289,7 @@ class Nestbox
      */
     protected function create_class_table_nestbox_settings(): bool
     {
-        $sql = "CREATE TABLE IF NOT EXISTS `nestbox_settings` (
+        $sql = "CREATE TABLE IF NOT EXISTS `" . Nestbox::NESTBOX_SETTINGS_TABLE . "` (
                     `package_name` VARCHAR( 64 ) NOT NULL ,
                     `setting_name` VARCHAR( 64 ) NOT NULL ,
                     `setting_type` VARCHAR( 64 ) NOT NULL ,
@@ -1276,6 +1298,20 @@ class Nestbox
                 ) ENGINE = InnoDB DEFAULT CHARSET=UTF8MB4 COLLATE=utf8mb4_general_ci;";
 
         return $this->query_execute($sql);
+    }
+
+
+    public function is_setting(string $settingName): bool
+    {
+        return (bool)$this->get_setting($settingName);
+    }
+
+
+    public function get_setting(string $settingName): array
+    {
+        $setting = $this->select(table: static::NESTBOX_SETTINGS_TABLE, where: ["setting_name" => $settingName]);
+
+        return $this->parse_settings($setting);
     }
 
 
@@ -1294,14 +1330,15 @@ class Nestbox
      *
      * @return array
      */
-    public function load_settings(string $package = null): array
+    public function load_settings(): array
     {
-        $settings = $this->get_settings($package);
+        $settings = $this->get_settings(static::PACKAGE_NAME);
 
         foreach ($settings as $name => $value) {
-            if (property_exists($this, $name)) {
-                $this->update_setting($name, $value);
-            }
+            if (!property_exists($this, $name)) continue;
+
+            $type = $this->parse_setting_type($value);
+            $this->$name = $this->setting_type_conversion($type, $value);
         }
 
         return $settings;
@@ -1315,14 +1352,39 @@ class Nestbox
      * @param string $value
      * @return bool
      */
-    public function update_setting(string $name, mixed $value): bool
+    public function update_setting(string $name, mixed $value): int|bool
     {
-        if (!property_exists($this, $name)) return false;
+        if (!$this->is_setting($name)) return false;
 
-        $type = $this->parse_setting_type($value);
-        $this->$name = $this->setting_type_conversion($type, $value);
+        $row = [
+            "setting_name" => $name,
+            "setting_value" => $value
+        ];
 
-        return true;
+        $updateCount = $this->update(static::NESTBOX_SETTINGS_TABLE, $row);
+        if (false === $updateCount) return false;
+        $this->load_settings();
+        return $updateCount;
+    }
+
+
+    public function update_settings(array $settings): int|bool
+    {
+        $updateCount = 0;
+
+        foreach ($settings as $settingName => $settingValue) {
+            if (!$this->is_setting($settingName)) continue;
+
+            $update = [
+                "setting_name" => $settingName,
+                "setting_value" => $settingValue
+            ];
+
+            $updateCount += $this->update(static::NESTBOX_SETTINGS_TABLE, $update);
+        }
+
+        $this->load_settings();
+        return $updateCount;
     }
 
 
@@ -1331,18 +1393,17 @@ class Nestbox
      *
      * @return void
      */
-    public function save_settings(string $package = null): int|bool
+    public function save_settings(string $packageName = null): int|bool
     {
-        $package = ($package) ?: self::PACKAGE_NAME;
-
-        $saves = 0;
         $settings = [];
 
+        $packageName = ($packageName) ?: static::PACKAGE_NAME;
+
         foreach (get_class_vars(get_class($this)) as $name => $value) {
-            if (!str_starts_with($name, needle: $package)) continue;
+            if (!str_starts_with($name, needle: $packageName)) continue;
 
             $settings[] = [
-                "package_name" => $package,
+                "package_name" => static::PACKAGE_NAME,
                 "setting_name" => $name,
                 "setting_type" => $this->parse_setting_type($value),
                 "setting_value" => strval($value),
@@ -1437,11 +1498,12 @@ class Nestbox
      */
     protected function create_class_table_nestbox_errors(): void
     {
-        $sql = "CREATE TABLE IF NOT EXISTS `nestbox_errors` (
+        $sql = "CREATE TABLE IF NOT EXISTS `" . static::NESTBOX_ERROR_TABLE . "` (
                     `error_id` INT NOT NULL AUTO_INCREMENT ,
                     `occurred` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ,
-                    `message` VARCHAR( 512 ) NOT NULL ,
-                    `query` VARCHAR( 4096 ) NOT NULL ,
+                    `message` VARCHAR( 1024 ) NOT NULL ,
+                    `request` VARCHAR( 4096 ) NOT NULL ,
+                    `details` VARCHAR( 4096 ) NOT NULL ,
                     PRIMARY KEY ( `error_id` )
                 ) ENGINE = InnoDB DEFAULT CHARSET=UTF8MB4 COLLATE=utf8mb4_general_ci;";
         $this->query_execute($sql);
@@ -1455,13 +1517,14 @@ class Nestbox
      * @param string $query
      * @return int
      */
-    protected function log_error(string $message, string $query): int
+    public function log_error(string $message, string $request, string $details): int
     {
         $error = [
             "message" => substr(string: $message, offset: 0, length: 512),
-            "query" => substr(string: $query, offset: 0, length: 4096),
+            "request" => substr(string: $request, offset: 0, length: 4096),
+            "details" => substr(string: $details, offset: 0, length: 4096),
         ];
-        return $this->insert(table: 'nestbox_errors', rows: $error);
+        return $this->insert(table: static::NESTBOX_ERROR_TABLE, rows: $error);
     }
 
 
