@@ -1,11 +1,11 @@
 <?php
 
-declare( strict_types = 1 );
+declare(strict_types=1);
 
 namespace NestboxPHP\Nestbox\Exception;
 
-use NestboxPHP\Nestbox\Nestbox;
 use RuntimeException;
+use NestboxPHP\Nestbox\Nestbox;
 
 class NestboxException extends RuntimeException
 {
