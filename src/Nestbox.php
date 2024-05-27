@@ -629,7 +629,8 @@ class Nestbox
             $clause[] = "`$column` $operator :$column";
             $params[$column] = $value;
         }
-        $clause = ($params) ? "WHERE " . implode($this::validate_conjunction($conjunction), $clause) : "";
+        $conjunction = " ". $this::validate_conjunction($conjunction) ." ";
+        $clause = ($params) ? "WHERE " . implode($conjunction, $clause) : "";
         return [$clause, $params];
     }
 
