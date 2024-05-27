@@ -4,7 +4,10 @@ declare(strict_types=1);
 
 namespace NestboxPHP\Nestbox;
 
-use Exception;
+use NestboxPHP\Nestbox\Exception\FailedToPrepareStatement;
+use NestboxPHP\Nestbox\Exception\ResultFetchException;
+use NestboxPHP\Nestbox\Exception\TransactionImplicitCommitNotAllowed;
+use NestboxPHP\Nestbox\Exception\TransactionNotInProgressException;
 use PDO;
 use PDOException;
 use PDOStatement;
@@ -38,6 +41,7 @@ class Nestbox
     public const PACKAGE_NAME = 'nestbox';
     public const NESTBOX_SETTINGS_TABLE = 'nestbox_settings';
     public const NESTBOX_ERROR_TABLE = 'nestbox_errors';
+    final protected const NESTBOX_DIRECTORY = "../nestbox";
 
     // connection properties
     protected string $host = 'localhost';
@@ -161,7 +165,7 @@ class Nestbox
 
 
     /**
-     * Calls all class methods that start with `create_class_table_`
+     * Calls all class methods that start with `create_class_table_` and refreshes `$this->tableSchema`
      *
      * @return void
      */
@@ -171,6 +175,48 @@ class Nestbox
             if (str_starts_with(haystack: $methodName, needle: "create_class_table_")) $this->$methodName();
         }
         $this->load_table_schema(forceReload: true);
+    }
+
+
+    /**
+     * Takes a string or array of folder names, verifies path separators, validates the provided path relative to the
+     * `$_SERVER["DOCUMENT_ROOT"]` directory by prepending it if it isn't already present, then finally returns the
+     * generated string
+     *
+     * @param string|array $path
+     * @return string
+     */
+    protected function generate_document_root_relative_path(string|array $path): string
+    {
+        $path = (is_array($path)) ? implode(separator: DIRECTORY_SEPARATOR, array: $path) : $path;
+
+        $path = (!str_contains(haystack: $path, needle: $_SERVER["DOCUMENT_ROOT"]))
+            ? implode("/", [$_SERVER["DOCUMENT_ROOT"], $path]) : $path;
+
+        return trim(
+            string: preg_replace(pattern: '#[/\\\\]+#', replacement: DIRECTORY_SEPARATOR, subject: $path),
+            characters: DIRECTORY_SEPARATOR
+        );
+    }
+
+
+    /**
+     * Uses `generate_document_root_relative_path()` to validate the `$path` input, then recursively creates the given
+     * directory path with the defined permissions
+     *
+     * @param string|array $path
+     * @param int $permissions
+     * @return bool
+     */
+    protected function create_document_root_relative_directory(string|array $path, int $permissions): bool
+    {
+        if (is_array($path) or !str_contains(haystack: $path, needle: $_SERVER["DOCUMENT_ROOT"]))
+            $path = $this->generate_document_root_relative_path($path);
+
+        if (!file_exists($path))
+            return mkdir(directory: $path, permissions: $permissions, recursive: true);
+
+        return chmod(filename: $path, permissions: $permissions);
     }
 
 
@@ -186,12 +232,12 @@ class Nestbox
 
 
     /**
-     * Connect to the database, returns `true` on a successful connect, otherwise `false`
+     * Creates a new connection to the database or uses the current one if it exists
      *
-     * @return bool
+     * @return true
      * @throws NestboxException
      */
-    public function connect(): bool
+    public function connect(): true
     {
         // check for existing connection
         if ($this->check_connection()) return true;
@@ -199,10 +245,10 @@ class Nestbox
         // MySQL Database
         try {
             $this->pdo = new PDO(
-                "mysql:host=$this->host;dbname=$this->name",
-                $this->user,
-                $this->pass,
-                [
+                dsn: "mysql:host=$this->host;dbname=$this->name",
+                username: $this->user,
+                password: $this->pass,
+                options: [
                     PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
                     PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
                     PDO::ATTR_PERSISTENT => true,
@@ -211,7 +257,8 @@ class Nestbox
                 ]
             );
         } catch (PDOException $e) {
-            throw new NestboxException($e->getMessage());
+            // re-throw as NestboxException for class catching
+            throw new NestboxException($e->getMessage(), $e->getCode(), $e->getPrevious());
         }
 
         // successful connection
@@ -220,14 +267,14 @@ class Nestbox
 
 
     /**
-     * Check if a connection exists, returns `true` if one exists, otherwise `false`
+     * Returns `true` if a connection exists and has not timed out, otherwise `false`
      *
      * @return bool
      */
     public function check_connection(): bool
     {
         if (!empty($this->pdo)) {
-            // test existing connection for timeout
+            // test existing connection for possible timeout
             $this->prep("SELECT 1");
             $this->execute();
             $rows = $this->fetch_all_results();
@@ -235,7 +282,7 @@ class Nestbox
             // check test results
             if (1 === $rows[0]['1']) return true;
 
-            // kill dead connection
+            // kill dead or timed-out connection
             $this->close();
         }
 
@@ -244,7 +291,7 @@ class Nestbox
 
 
     /**
-     * Close an existing connection
+     * Closes an existing connection
      *
      * @return void
      */
@@ -271,67 +318,61 @@ class Nestbox
      * Executes a query against the database, returns `true` on success, otherwise `false`
      *
      * @param string $query Non-empty string with SQL query
-     * @param array $params Array of key=>value pairs for :named paramaters
+     * @param array $params Array of key=>value pairs for :named parameters
      * @param bool $close Close the connection upon query execution
-     * @return bool
+     * @return true
      * @throws EmptyQueryException
      */
-    public function query_execute(string $query, array $params = [], bool $close = false): bool
+    public function query_execute(string $query, array $params = [], bool $close = false): true
     {
         // check query emptiness
-        if (empty(trim($query))) throw new EmptyQueryException;
+        if (empty(trim($query))) throw new EmptyQueryException("Cannot execute an empty query.");
 
         // connect to database
         $this->connect();
 
         // prepare statement and bind parameters
         $params = $this::validate_parameters($query, $params);
-        $this->prep($query, $params);
+        $this->prep($query);
         if ($params) foreach ($params as $col => $val) $this->bind($col, $val);
 
-        // execute, close if applicable, and return resutlts
-        $result = $this->execute();
+        // execute, close if applicable, and return results
+        $this->execute();
         if ($close) $this->close();
-        return $result;
+        return true;
     }
 
 
     /**
-     * Prepare a query statement, returns `true` on success, otherwise `false`
+     * Prepare a query statement
      *
      * @param string $query
-     * @param array|$params
-     * @return bool
+     * @return true
+     * @throws FailedToPrepareStatement
      */
-    protected function prep(string $query, array $params = []): bool
+    protected function prep(string $query): true
     {
-        // prepare a statement without parameters
-        if (empty($params)) {
-            if ($this->stmt = $this->pdo->prepare($query)) return true;
-            return false;
-        }
-
-        // prepare a statement with parameters
-        if ($this->stmt = $this->pdo->prepare($query, $params)) return true;
-        return false;
+        // prepare the query statement
+        if (!$this->stmt = $this->pdo->prepare($query))
+            throw new FailedToPrepareStatement($this->parse_pdo_error_info("Failed to prepare"));
+        return true;
     }
 
 
     /**
-     * Bind a variable to a named parameter, returns `true` on success, otherwise `false`
-     * TODO: update Exceptions for message creation
+     * Bind a variable to a named parameter
      *
      * @param $variable
      * @param $value
-     * @return bool
+     * @return true
      * @throws InvalidParameterValueType
      * @throws FailedToBindValueException
      */
-    protected function bind($variable, $value): bool
+    protected function bind($variable, $value): true
     {
         // set binding type
         $type = Nestbox::get_parameter_pdo_type($value);
-        if (false === $type) throw new InvalidParameterValueType("$variable => $value");
+        if (false === $type) throw new InvalidParameterValueType(variable: $variable, value: $value);
 
         // backwards compatibility or whatever
         $variable = (!str_starts_with($variable, ':')) ? ":$variable" : $variable;
@@ -340,7 +381,7 @@ class Nestbox
         if (true === $this->stmt->bindValue($variable, $value, $type)) return true;
 
         // we didn't do it
-        throw new FailedToBindValueException("$variable => ($type) $value");
+        throw new FailedToBindValueException($this->parse_statement_error_info("Failed to bind"));
     }
 
 
@@ -352,27 +393,29 @@ class Nestbox
      */
     public static function get_parameter_pdo_type($parameter): int|bool
     {
-        if (is_int($parameter)) return PDO::PARAM_INT;
-        if (is_bool($parameter)) return PDO::PARAM_BOOL;
-        if (is_null($parameter)) return PDO::PARAM_NULL;
-        if (is_array($parameter)) return false;
-        return PDO::PARAM_STR;
+        return match (gettype($parameter)) {
+            "boolean" => PDO::PARAM_BOOL,
+            "integer" => PDO::PARAM_INT,
+            "double", "string" => PDO::PARAM_STR,
+            "NULL" => PDO::PARAM_NULL,
+            default => false
+        };
     }
 
 
     /**
      * Execute a statement or throws either a QueryErrorException or a PDOException
      *
-     * @return bool
+     * @return true
      * @throws QueryErrorException
      * @throws PDOException
      */
-    protected function execute(): bool
+    protected function execute(): true
     {
         // execute query
         try {
             if ($this->stmt->execute()) return true;
-            throw new QueryErrorException(errorInfo: $this->stmt->errorInfo());
+            throw new QueryErrorException($this->parse_statement_error_info(prefix: "MySQL error"));
         } catch (PDOException $e) {
             throw new PDOException("PDO Exception: {$e->getMessage()}");
         }
@@ -396,7 +439,7 @@ class Nestbox
      *
      * @param string $query
      * @param array $params
-     * @return array
+     * @return array [`"param1"` => `$val1`, `"param2"` => `$val2`...]
      * @throws MissingParametersException
      */
     public static function validate_parameters(string $query, array $params): array
@@ -423,12 +466,18 @@ class Nestbox
         }
 
         // oh no, we forgot to pass one or more parameters!
-        if ($queryParams) throw new MissingParametersException($query . json_encode($queryParams));
+        if ($queryParams) throw new MissingParametersException(json_encode($queryParams));
 
         return $output;
     }
 
 
+    /**
+     * Returns "ASC" or "DESC" based on input string, case-insensitive, otherwise "ASC" for invalid input
+     *
+     * @param string $order
+     * @return string `"ASC"` | `"DESC"`
+     */
     public static function validate_order(string $order): string
     {
         return (in_array(strtoupper($order), ["ASC", "DESC"])) ? strtoupper($order) : "ASC";
@@ -439,7 +488,7 @@ class Nestbox
      * Ensures the conjunction provided for *WHERE* clause is *AND* or *OR*, otherwise returns *AND*
      *
      * @param string $conjunction
-     * @return string "AND" | "OR"
+     * @return string `"AND"` | `"OR"`
      */
     public static function validate_conjunction(string $conjunction): string
     {
@@ -452,7 +501,7 @@ class Nestbox
      * multidimensional array, or the keys of all elements in a flat array
      *
      * @param array $params
-     * @return array [col_name_1, col_name_2, ...]
+     * @return array [`"col1"`, `"col2"`...]
      */
     public static function generate_column_list_from_params(array $params): array
     {
@@ -460,6 +509,13 @@ class Nestbox
     }
 
 
+    /**
+     * Generates a VALUES clause with it's associated parameters in an array
+     * @param string $table
+     * @param array $values
+     * @return array [`"VALUES :col1, :col2"`.., [`"col1"` => `$val1`, `"col2"` => `$val2`...]]
+     * @throws InvalidColumnException
+     */
     public function generate_values_clause(string $table, array $values): array
     {
         $clause = [];
@@ -475,12 +531,13 @@ class Nestbox
 
 
     /**
-     * Takes an array of *[`col_name` => `col_val`]* and generates a string of `"$table.$column = new.$column"` values
-     * separated by commas to be used in the update clauses of queries
+     * Takes a parameter array of *[`"col_name"` => `$colVal`]* parameters and generates the as-new-on-duplicate-key-
+     * update clause with update strings of `"table.col1 = new.col1"` separated by commas, and the associated parameters
+     * array to use for binding the update values to the generated clause
      *
      * @param string $table
      * @param array $updates
-     * @return array
+     * @return array [`"AS...KEY UPDATE..."`, [`"col1"` => `$val1`, `"col2"` => `$val2`...]]
      * @throws InvalidColumnException
      */
     public function generate_update_clause_from_params(string $table, array $updates): array
@@ -505,12 +562,11 @@ class Nestbox
 
 
     /**
-     * Generates and returns a string of `col_name = :col_name` values separated by commas, along with an array of
-     * [col_name => col_value] to match the set clause string
+     * Generates the set clause with it's associated array of parameters to use for binding
      *
      * @param string $table
      * @param array $updates
-     * @return array [set_string, params]
+     * @return array [`"SET col1 = :col1..."`, [`"col1"` => `$val1`...]]
      */
     public function generate_set_clause(string $table, array $updates): array
     {
@@ -527,12 +583,11 @@ class Nestbox
 
 
     /**
-     * Takes an array of parameters and generates a string of `"(:named_1, :named_2), ..."` named parameters, separated
-     * by commas, and their associated values in a newly created parameters array for use in an INSERT statement in the
-     * VALUES clause
+     * Takes an array of parameters and generates a string of named parameters unique for each row to be inserted,
+     * separated by commas, and their associated parameters array to be used for binding
      *
      * @param array $params
-     * @return array ["(:named_1, :named_2), ...", ["named_1" => val_1, "named_2" => val_2, ...]
+     * @return array [`"(:col1_0, :col2_0), (:col1_1, :col2_1)..."`, [`"col1_0"` => `$val_1`,... `"col2_1"` => `$val_x`...]
      */
     public static function generate_named_values_list(array $params): array
     {
@@ -555,14 +610,14 @@ class Nestbox
 
 
     /**
-     * Generates a `WHERE col = :col [AND|OR ...]" string for valid `$where` parameters, an empty string if `$where` is
-     * empty, or throws an Exception if one or more column names are invalid
+     * Generates a where clause with it's associated array of parameters for binding, or an empty string if `$where` has
+     * no values; each key in the `$where` parameter must be a valid column and may include a space and any of following
+     * operators: `=` *(default)*, `>`, `<`, `>=`, `<=`, `<>`, `!=`, `BETWEEN`, `LIKE`, `IN`
      *
      * @param string $table
-     * @param array $where keys can include any of the following operators with the column name: "=", ">", "<", ">=",
-     *  "<=", "<>", "!=", "BETWEEN", "LIKE", "IN"
-     * @param string $conjunction can be "AND" or "OR", case-insensitive
-     * @return array
+     * @param array $where [`"col"` => `$val`] pairs with optional space and operator appended to column name
+     * @param string $conjunction can be `"AND"` *(default)* or `"OR"`, case-insensitive
+     * @return array [`"WHERE col1 = :col1 [AND|OR...]"`, [`"col1"` => `$col1`...]]
      */
     public function generate_where_clause(string $table, array $where, string $conjunction): array
     {
@@ -580,12 +635,12 @@ class Nestbox
 
 
     /**
-     * Generates a "LIMIT $start, $limit" string if `$start` and `$limit` are greater than *0*, a "LIMIT $limit" if only
-     * `$limit` is greater than *0*, otherwise returns an empty string
+     * Generates a limit clause depending on whether one or both `$start` and `$limit` parameters are greater than `0`,
+     * otherwise returns an empty string
      *
      * @param int $start
      * @param int $limit
-     * @return string
+     * @return string `"LIMIT $start, $limit"` | `"LIMIT $limit"` | `""`
      */
     public static function generate_limit_clause(int $start = 0, int $limit = 0): string
     {
@@ -595,23 +650,31 @@ class Nestbox
 
 
     /**
-     * Parses the operator portion of a string used for where, such as `col_name =`, where the return array would be
-     * *["col_name", "="]*; the column names are **NOT** validated against a schema
+     * Takes the key string from a `$where` parameter elsewhere and returns an array with the column name and any
+     * included operator, defaulting to `"="` if no operator is present; the column names are __NOT__ validated against
+     * any table schema and should be verified elsewhere
      *
      * @param string $columnWithOperator
-     * @return array
+     * @return array [`"col"`, `"="`...]
      * @throws InvalidWhereOperator
      */
-    public static function parse_where_operator(string $columnWithOperator): array
+    protected static function parse_where_operator(string $columnWithOperator): array
     {
-        if (!preg_match('/^`?(\w+)`?\s+([<!=>]{1,2}|between|like|in)$/i', trim($columnWithOperator), $matches)) {
+        $pattern = "/^`?(\w+)`?\s+([<!=>]{1,2}|between|like|in|is(\snot)?)$/i";
+        //                                                         ^lol
+
+        // if no operator exists, default to "="
+        if (!preg_match($pattern, trim($columnWithOperator), $matches)) {
             $matches = [$columnWithOperator, self::valid_schema_string($columnWithOperator), "="];
         }
 
-        if (!in_array(strtoupper($matches[2]), ["=", ">", "<", ">=", "<=", "<>", "!=", "BETWEEN", "LIKE", "IN", "IS", "IS NOT"])) {
-            throw new InvalidWhereOperator($matches[2]);
-        }
+        $validOperators = ["=", ">", "<", ">=", "<=", "<>", "!=", "BETWEEN", "LIKE", "IN", "IS", "IS NOT"];
 
+        // make sure the operator is valid, such as proper order of <, !, =, and > characters
+        if (!in_array(strtoupper($matches[2]), $validOperators))
+            throw new InvalidWhereOperator($matches[2]);
+
+        // return column name and the operator
         return [$matches[1], strtoupper($matches[2])];
     }
 
@@ -630,33 +693,48 @@ class Nestbox
     /**
      * Return complete result set
      *
-     * @return array|false
+     * @param int $fetchMode `PDO::FETCH_ASSOC`
+     * @return array
+     * @throws ResultFetchException
      */
-    public function fetch_all_results(int $fetchMode = PDO::FETCH_ASSOC): array|false
+    public function fetch_all_results(int $fetchMode = PDO::FETCH_ASSOC): array
     {
-        return $this->stmt->fetchAll($fetchMode);
+        $results = $this->stmt->fetchAll($fetchMode);
+        if (false === $results)
+            throw new ResultFetchException($this->parse_statement_error_info("Fetch all error"));
+        return $results;
     }
 
 
     /**
      * Fetch first row from result set
      *
-     * @return array|false
+     * @param int $fetchMode `PDO::FETCH_ASSOC`
+     * @return array
+     * @throws ResultFetchException
      */
-    public function fetch_first_result(int $fetchMode = PDO::FETCH_ASSOC): array|false
+    public function fetch_first_result(int $fetchMode = PDO::FETCH_ASSOC): array
     {
-        return $this->stmt->fetchAll($fetchMode)[0] ?? false;
+        $results = $this->stmt->fetchAll($fetchMode);
+        if (false === $results)
+            throw new ResultFetchException($this->parse_statement_error_info("Fetch first error"));
+        return $results[0] ?? [];
     }
 
 
     /**
      * Fetch next result in a set
      *
-     * @return array|false
+     * @param int $fetchMode `PDO::FETCH_ASSOC`
+     * @return array
+     * @throws ResultFetchException
      */
-    public function fetch_next_result(int $fetchMode = PDO::FETCH_ASSOC): array|false
+    public function fetch_next_result(int $fetchMode = PDO::FETCH_ASSOC): array
     {
-        return $this->stmt->fetch($fetchMode);
+        $result = $this->stmt->fetch($fetchMode);
+        if (false === $result)
+            throw new ResultFetchException($this->parse_statement_error_info("Fetch next error"));
+        return $result;
     }
 
 
@@ -694,11 +772,12 @@ class Nestbox
 
 
     /**
-     * Inserts one or more rows of data, updating existing rows based on primary key
+     * Inserts one or more rows of data, updating existing rows based on primary key; `$rows` may be a single array with
+     * column names and values to insert, or a multidimensional array where each child array is the row to insert.
      *
      * @param string $table
-     * @param array $rows
-     * @param bool $updateOnDuplicate
+     * @param array $rows [`"col1"` => `$val1`] | [`0` => [`"col1"` => `$val1`...]...]
+     * @param bool $updateOnDuplicate `true`
      * @return int|bool
      * @throws EmptyParamsException
      * @throws MismatchedColumnNamesException
@@ -707,6 +786,18 @@ class Nestbox
      */
     public function insert(string $table, array $rows, bool $updateOnDuplicate = true): int|bool
     {
+        /**
+         * TODO: A note for myself: I could take out the MismatchedColumnNamesException if I pre-loaded the default
+         * TODO: columns and set them to null or an empty string depending on the table structure requirements, but this
+         * TODO: would assume the insert array was created properly and wouldn't take into account when typos or user
+         * TODO: error decides to join the party, as is typically the case. Options to be thought over.
+         *
+         * example:
+         * $defaultColumns = array_combine(
+         *     keys: array_keys($this->tableSchema[$tableName]),
+         *     values: array_fill(0, count($this->tableSchema[$tableName]), "")
+         * );
+         */
         // verify table
         if (!$this->valid_schema($table)) throw new InvalidTableException(table: $table);
 
@@ -736,8 +827,9 @@ class Nestbox
                     throw new MismatchedColumnNamesException(array1: $columns, array2: array_keys($row));
                 }
 
-                $params["{$column}_$i"] = $value;
-                $vals[] = ":{$column}_$i";
+                $paramName = preg_replace("/\s/", "_", "{$column}_$i");
+                $params[$paramName] = $value;
+                $vals[] = ":$paramName";
             }
 
             $values[] = implode(", ", $vals);
@@ -767,13 +859,15 @@ class Nestbox
      * @param array $where
      * @param string $conjunction
      * @return int|bool
-     * @throws RandomException
      */
     public function update(string $table, array $updates, array $where = [], string $conjunction = "AND"): int|bool
     {
         /**
-         * It's possible to update multiple rows at once using the following style of query, although this could take
-         * some significant work to implement:
+         * TODO: It's possible to update multiple rows at once using the following style of query by identifying the
+         * TODO: table's primary key and using it in tandem with a case statement, although this does seem exceptionally
+         * TODO: convoluted and could take some significant work to implement. Second- and third-order effects would
+         * TODO: include a more robust implementation of the where operator parser and the where clause generator to
+         * TODO: handle arrays of values. Food for thought, I guess.
          *
          * UPDATE my_table
          * SET value_to_update =
@@ -801,8 +895,9 @@ class Nestbox
                 continue;
             }
 
-            $setClause[] = "`$column` = :$column";
-            $setParams[$column] = $value;
+            $paramName = preg_replace("/\s/", "_", $column);
+            $setClause[] = "`$column` = :$paramName";
+            $setParams[$paramName] = $value;
         }
         $setClause = ($setParams) ? implode(", ", $setClause) : "";
 
@@ -811,14 +906,20 @@ class Nestbox
         $whereParams = [];
         foreach ($where as $column => $value) {
             list($column, $operator) = $this::parse_where_operator($column);
-            
+
             if (!$this->valid_schema($table, $column)) throw new InvalidColumnException(table: $table, column: $column);
-            
+
             $whereKey = "where_$column";
             if (in_array($whereKey, $setParams) or $this->valid_schema($table, $whereKey)) {
                 // basic key matches an actual column, so we need to generate one that likely isn't a real column
                 while (in_array($whereKey, $setParams) or $this->valid_schema($table, $whereKey)) {
-                    $whereKey = "where_{$column}_" . bin2hex(random_bytes(10));
+                    // technically this could loop forever, but the likelihood is astronomical
+                    try {
+                        $whereKey = "where_{$column}_" . bin2hex(random_bytes(10));
+                    } catch (RandomException $e) {
+                        // re-throw as NestboxException for class catching
+                        throw new NestboxException($e->getMessage(), $e->getCode(), $e->getPrevious());
+                    }
                 }
             }
 
@@ -826,7 +927,7 @@ class Nestbox
             $whereParams[$whereKey] = $value;
         }
         $whereClause = (!$whereParams) ? ""
-            : "WHERE " . implode(" ". $this::validate_conjunction($conjunction) ." ", $whereClause);
+            : "WHERE " . implode(" " . $this::validate_conjunction($conjunction) . " ", $whereClause);
 
         // aggregate and execute query
         $sql = (!$whereClause) ? "UPDATE `$table` SET $setClause;" : "UPDATE `$table` SET $setClause $whereClause;";
@@ -859,27 +960,18 @@ class Nestbox
         $selectClause = "SELECT * FROM `$table`";
 
         // generate where clause
-        $whereClause = [];
-        $params = [];
-        foreach ($where as $column => $value) {
-            list($column, $operator) = $this::parse_where_operator($column);
-            if (!$this->valid_schema($table, $column)) throw new InvalidColumnException(table: $table, column: $column);
-            $whereClause[] = "`$column` $operator :$column";
-            $params[$column] = $value;
-        }
-        $whereClause = (!$params) ? ""
-            : "WHERE " . implode(" ". $this::validate_conjunction($conjunction) ." ", $whereClause);
+        list($whereClause, $params) = $this->generate_where_clause($table, $where, $conjunction);
 
         // generate order by clause
         $orderByClause = [];
         foreach ($orderBy as $column => $order) {
             if (!$this->valid_schema($table, $column)) throw new InvalidColumnException(table: $table, column: $column);
-            $orderByClause[] = $column ." ". $this::validate_order($order);
+            $orderByClause[] = $column . " " . $this::validate_order($order);
         }
         $orderByClause = ($orderByClause) ? "ORDER BY " . implode(", ", $orderByClause) : "";
 
         // generate limit clause
-        $limitClause = ($limit) ? ($start) ? "LIMIT $start, $limit" : "LIMIT $limit" : "";
+        $limitClause = static::generate_limit_clause($start, $limit);
 
         // execute and get results
         if (!$this->query_execute("$selectClause $whereClause $orderByClause $limitClause;", $params)) {
@@ -909,16 +1001,7 @@ class Nestbox
         }
 
         // generate where clause
-        $whereClause = [];
-        $params = [];
-        foreach ($where as $column => $value) {
-            list($column, $operator) = $this::parse_where_operator($column);
-            if (!$this->valid_schema($table, $column)) throw new InvalidColumnException(table: $table, column: $column);
-            $whereClause[] = "`$column` $operator :$column";
-            $params[$column] = $value;
-        }
-        $whereClause = (!$params) ? ""
-            : "WHERE " . implode(" ". $this::validate_conjunction($conjunction) ." ", $whereClause);
+        list($whereClause, $params) = $this->generate_where_clause($table, $where, $conjunction);
 
         if (!$this->query_execute("DELETE FROM $table $whereClause;", $params)) return false;
 
@@ -935,124 +1018,267 @@ class Nestbox
      *   |_||_|  \__,_|_| |_|___/\__,_|\___|\__|_|\___/|_| |_|___/
      *
      */
+
+
     /**
-     * Use a single query to perform an incremental transaction
+     * Starts a new transaction
+     *
+     * @return true
+     * @throws TransactionInProgressException
+     * @throws TransactionBeginFailedException
+     */
+    public function transaction_start(): true
+    {
+        $this->connect();
+
+        if ($this->pdo->inTransaction())
+            throw new TransactionInProgressException("Can't start a new transaction while one is in progress.");
+
+        if (!$this->pdo->beginTransaction()) {
+            $errorInfo = $this->pdo->errorInfo();
+            $error = "Failed to begin new transaction [$errorInfo[0]]: $errorInfo[2] ($errorInfo[1])";
+            throw new TransactionBeginFailedException($error);
+        }
+
+        return true;
+    }
+
+
+    /**
+     * Increments a transaction with a query
      *
      * @param string $query
-     * @param array $params
-     * @param bool $commit
-     * @param bool $close
+     * @param array|null $params
      * @return array
+     * @throws TransactionNotInProgressException
      */
-    public function transaction(string $query, array $params, bool $commit = false, bool $close = false): array
+    public function transaction_increment(string $query, array|null $params = null): array
     {
-        try {
-            // start transaction if not already in progress
-            if (!$this->pdo->inTransaction()) {
-                $this->pdo->beginTransaction();
-                if (!$this->pdo->inTransaction()) {
-                    // couldn't start a transaction
-                    throw new TransactionBeginFailedException("Failed to begin new transaction.");
-                }
-            }
+        $implicitCommitOccurred = false;
 
-            // perform single query for the transaction
-            if ($this->execute($query, $params)) {
-                $results = [
-                    'rows' => $this->fetch_all_results(),
-                    'row_count' => $this->get_row_count(),
-                    'last_id' => $this->get_last_insert_id(),
-                ];
-            }
+        if (!$this->pdo->inTransaction())
+            throw new TransactionNotInProgressException("No transaction in progress to increment.");
 
-            // commit the transaction and return any results
-            if (true === $commit) {
-                if ($this->pdo->commit()) {
-                    // commit the transaction and return the results
-                    return $results;
-                } else {
-                    throw new TransactionCommitFailedException("Failed to commit transaction.");
-                }
-            } else {
-                // return the query results but leave transaction in progress
-                return $results;
+        $this->prep($query);
+
+        if (is_array($params)) {
+            foreach ($params as $variable => $value) {
+                $this->bind($variable, $value);
             }
-        } catch (Exception $e) {
-            // oh no! roll back database and re-throw whatever fun error was encountered
-            if (!$this->rollback()) {
-                // we're really not having a good day today are we...
-                throw new TransactionRollbackFailedException($e->getMessage() . " -- AND -- Failed to rollback database transaction.");
-            }
-            throw new TransactionException($e->getMessage());
         }
+
+        if (!$this->execute()) {
+            return [
+                "rows" => 0,
+                "row_count" => 0,
+                "last_id" => "",
+                "implicit_commit_occurred" => false,
+                "success" => false,
+                "error_info" => $this->pdo->errorInfo()
+            ];
+        }
+
+        if (!$this->pdo->inTransaction()) {
+            $implicitCommitOccurred = true;
+            $this->transaction_start();
+        }
+
+        return [
+            "rows" => $this->fetch_all_results(),
+            "row_count" => $this->get_row_count(),
+            "last_id" => $this->get_last_insert_id(),
+            "implicit_commit_occurred" => $implicitCommitOccurred,
+            "success" => true,
+            "error_info" => ["", "", ""]
+        ];
     }
 
 
     /**
-     * Pass an array of SQL queries and perform a transaction with them
+     * Rollback the current transaction
+     *
+     * @return true
+     * @throws TransactionRollbackFailedException
+     */
+    public function transaction_rollback(): true
+    {
+        if (!$this->pdo->inTransaction())
+            throw new TransactionNotInProgressException("Cannot rollback a transaction not in progress.");
+
+        if (!$this->pdo->rollback())
+            throw new TransactionRollbackFailedException("Failed to rollback transaction.");
+
+        return true;
+    }
+
+
+    /**
+     * Commits transaction changes to database
+     *
+     * @return true
+     * @throws TransactionNotInProgressException
+     * @throws TransactionCommitFailedException
+     */
+    public function transaction_commit(): true
+    {
+        if (!$this->pdo->inTransaction())
+            throw new TransactionNotInProgressException("Cannot commit a transaction not in progress.");
+
+        if (!$this->pdo->commit())
+            throw new TransactionCommitFailedException("Failed to commit transaction.");
+
+        return true;
+    }
+
+
+    /**
+     * Detects if a query would trigger an implicit commit as defined by the MySQL documentation:
+     * https://dev.mysql.com/doc/refman/8.0/en/implicit-commit.html
+     *
+     * @param string $query
+     * @return string|false
+     */
+    public function transaction_implicit_commit_detection(string $query): string|false
+    {
+        // Split a query
+        $subqueries = array_filter(explode(";", $query));
+
+        // Data definition language statements that define or modify database objects
+        $ddl = [
+            "/^ALTER (EVENT|FUNCTION|PROCEDURE|SERVER|TABLE|TABLESPACE|VIEW).*$/i",
+            "/^CREATE (DATABASE|EVENT|FUNCTION|INDEX|PROCEDURE|ROLE|SERVER|SPATIAL REFERENCE SYSTEM|TABLE|TABLESPACE|TRIGGER|VIEW).*$/i",
+            "/^DROP (DATABASE|EVENT|FUNCTION|INDEX|PROCEDURE|ROLE|SERVER|SPATIAL REFERENCE SYSTEM|TABLE|TABLESPACE|TRIGGER|VIEW).*$/i",
+            "/^(INSTALL|UNINSTALL) PLUGIN.*$/i",
+            "/^(RENAME|TRUNCATE) TABLE.*$/i",
+        ];
+
+        foreach ($subqueries as $query) {
+            foreach ($ddl as $pattern) {
+                if (preg_match($pattern, $query))
+                    return "Data definition language: $query";
+            }
+        }
+
+        // Statements that implicitly use or modify the tables in the mysql database
+        $mysql = [
+            "/^(ALTER|CREATE|DROP|RENAME) USER.*$/i",
+            "/^GRANT.*$/i",
+            "/^REVOKE.*$/i",
+            "/^SET PASSWORD.*$/i",
+        ];
+
+        foreach ($subqueries as $query) {
+            foreach ($mysql as $pattern) {
+                if (preg_match($pattern, $query))
+                    return "MySQL database usage or modification: $query";
+            }
+        }
+
+        // Transaction-control and locking statements
+        $tcls = [
+            "/^BEGIN.*$/i",
+            "/^LOCK TABLES.*$/i",
+            "/^SET autocommit = 1.*$/i",
+            "/^START TRANSACTION.*$/i",
+            "/^UNLOCK TABLES.*$/i"
+        ];
+
+        foreach ($subqueries as $query) {
+            foreach ($tcls as $pattern) {
+                if (preg_match($pattern, $query))
+                    return "Transaction-control or locking statement: $query";
+            }
+        }
+
+        // Data loading statements
+        $data = [
+            "/^LOAD DATA.*$/i"
+        ];
+
+        foreach ($subqueries as $query) {
+            foreach ($data as $pattern) {
+                if (preg_match($pattern, $query))
+                    return "Data loading statement: $query";
+            }
+        }
+
+        // Administrative statements
+        $admin = [
+            "/^ANALYZE TABLE.*$/i",
+            "/^CACHE INDEX.*$/i",
+            "/^(CHECK|OPTIMIZE|REPAIR) TABLE.*$/i",
+            "/^FLUSH.*$/i",
+            "/^LOAD INDEX INTO CACHE.*$/i",
+            "/^RESET (?!PERSIST).*$/i"
+        ];
+
+        foreach ($subqueries as $query) {
+            foreach ($admin as $pattern) {
+                if (preg_match($pattern, $query))
+                    return "Administrative statement: $query";
+            }
+        }
+
+        // Replication control statements
+        $rcs = [
+            "/^(START|STOP|RESET) REPLICA.*$/i",
+            "/^CHANGE (REPLICATION SOURCE|MASTER) TO.*$/i"
+        ];
+
+        foreach ($subqueries as $query) {
+            foreach ($rcs as $pattern) {
+                if (preg_match($pattern, $query))
+                    return "Replication control statement: $query";
+            }
+        }
+
+        return false;
+    }
+
+
+    /**
+     * Pass an array of SQL queries, where the key is the query and the value is an array of parameters (or empty/null)
+     * and perform a transaction with them
      *
      * @param array $queries
-     * @return array
+     * @param bool $commit
+     * @param bool $rollbackOnFail
+     * @param bool $allowImplicitCommits
+     * @return array|false
+     * @throws TransactionImplicitCommitNotAllowed
      */
-    public function transaction_execute(array $queries): array
+    public function transaction_execute(array $queries, bool $commit = false, bool $rollbackOnFail = true,
+                                        bool $allowImplicitCommits = false): array|false
     {
-        try {
-            // connect to database
-            $this->connect();
+        $results = [];
 
-            // start transaction if not already in progress
-            if ($this->pdo->inTransaction()) {
-                throw new TransactionInProgressException("Unable to start new transaction while one is already in progress.");
-            }
-            $this->pdo->beginTransaction();
+        $this->transaction_start();
 
-            // perform transaction
-            $results = [];
-            foreach ($queries as $query => $params) {
-                // prepare query
-                $this->prep($query, $params);
+        foreach ($queries as $query => $params) {
+            if (true !== $allowImplicitCommits) {
+                $implicitCommit = $this->transaction_implicit_commit_detection($query);
 
-                // bind parameters
-                if (!empty($params)) {
-                    foreach ($params as $var => $val) {
-                        $this->bind($var, $val);
-                    }
-                }
-
-                if ($this->execute()) {
-                    $results[] = [
-                        'rows' => $this->fetch_all_results(),
-                        'row_count' => $this->get_row_count(),
-                        'last_id' => $this->get_last_insert_id(),
-                    ];
-                }
+                if ($implicitCommit)
+                    throw new TransactionImplicitCommitNotAllowed($implicitCommit);
             }
 
-            // commit the transaction and return any results
-            if ($this->pdo->commit()) {
-                return $results;
-            } else {
-                throw new TransactionCommitFailedException("Failed to commit transaction.");
+            $result = $this->transaction_increment($query, $params);
+
+            if (!$result and $rollbackOnFail) {
+                $this->transaction_rollback();
+                return false;
             }
-        } catch (Exception $e) {
-            // Oh no, we dun goof'd! Roll back database and re-throw the error
-            $this->pdo->rollback();
-            throw new TransactionException($e->getMessage());
+
+            $results[] = $result;
         }
-    }
 
-
-    /**
-     * @return bool
-     */
-    public function rollback(): bool
-    {
-        if ($this->pdo->inTransaction()) {
-            if ($this->pdo->rollback()) {
-                return true;
-            }
+        if (true === $commit) {
+            $this->transaction_commit();
+        } else {
+            $this->transaction_rollback();
         }
-        return false;
+
+        return $results;
     }
 
 
@@ -1234,7 +1460,7 @@ class Nestbox
 
     static public function valid_schema_string(string $string): string
     {
-        if (!preg_match(pattern: "/^\w+$/i", subject: trim($string), matches: $matches)) {
+        if (!preg_match(pattern: "/^[\w\s]+$/i", subject: trim($string), matches: $matches)) {
             throw new InvalidSchemaSyntaxException($string);
         }
 
@@ -1350,7 +1576,7 @@ class Nestbox
      *
      * @param string $name
      * @param string $value
-     * @return bool
+     * @return int|bool
      */
     public function update_setting(string $name, mixed $value): int|bool
     {
@@ -1391,7 +1617,8 @@ class Nestbox
     /**
      * Saves current settings to the settings table
      *
-     * @return void
+     * @param string|null $packageName
+     * @return int|bool
      */
     public function save_settings(string $packageName = null): int|bool
     {
@@ -1452,10 +1679,10 @@ class Nestbox
 
 
     /**
-     * Converts and returns $value into type defined by $type
+     * Converts and returns `$value` into type defined by `$type`
      *
      * @param string $type
-     * @param string $value
+     * @param int|float|bool|array|string $value
      * @return int|float|bool|array|string
      */
     protected function setting_type_conversion(string $type, int|float|bool|array|string $value): int|float|bool|array|string
@@ -1514,7 +1741,8 @@ class Nestbox
      * Logs an error
      *
      * @param string $message
-     * @param string $query
+     * @param string $request
+     * @param string $details
      * @return int
      */
     public function log_error(string $message, string $request, string $details): int
@@ -1525,6 +1753,20 @@ class Nestbox
             "details" => substr(string: $details, offset: 0, length: 4096),
         ];
         return $this->insert(table: static::NESTBOX_ERROR_TABLE, rows: $error);
+    }
+
+
+    public function parse_pdo_error_info(string $prefix): string
+    {
+        $error = $this->pdo->errorInfo();
+        return trim("$prefix [$error[0]]: $error[2] ($error[1])");
+    }
+
+
+    public function parse_statement_error_info(string $prefix): string
+    {
+        $error = $this->stmt->errorInfo();
+        return trim("$prefix [$error[0]]: $error[2] ($error[1])");
     }
 
 
@@ -1594,11 +1836,12 @@ class Nestbox
 
     /**
      * Takes a JSON string of tables and rows, inserts the table data, and returns the number of rows inserted; if
-     * `$truncate` is set to `true` the tables will be truncated before insert
+     * `$truncate` is set to `true`, the tables will be truncated before insert and cannot be rolled back if attempted
+     * during a transaction
      *
      * @param string|array $input
      * @param bool $truncate
-     * @return int
+     * @return array
      */
     public function load_database(string|array $input, bool $truncate = false): array
     {
@@ -1616,5 +1859,31 @@ class Nestbox
         }
 
         return [$updateCount, $errors];
+    }
+
+    protected function create_import_queue_directory(): true
+    {
+        return true;
+    }
+
+    protected function save_json_in_queue_directory(): true
+    {
+        return true;
+    }
+
+    protected function process_queue(): true
+    {
+        // load queue files
+        // get start time
+        // get script timeout seconds
+        // loop through files
+        // get table name
+        // calculate seconds per row
+        // get row count
+        // estimate time of insert
+        // return if estimate is over script timeout
+        // if more than 3000 rows, row chunk
+        // insert rows
+        return true;
     }
 }
