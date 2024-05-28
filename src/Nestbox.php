@@ -701,8 +701,10 @@ class Nestbox
     public function fetch_all_results(int $fetchMode = PDO::FETCH_ASSOC): array
     {
         $results = $this->stmt->fetchAll($fetchMode);
+
         if (false === $results)
             throw new ResultFetchException($this->parse_statement_error_info("Fetch all error"));
+
         return $results;
     }
 
@@ -779,13 +781,13 @@ class Nestbox
      * @param string $table
      * @param array $rows [`"col1"` => `$val1`] | [`0` => [`"col1"` => `$val1`...]...]
      * @param bool $updateOnDuplicate `true`
-     * @return int|bool
+     * @return int|false
      * @throws EmptyParamsException
      * @throws MismatchedColumnNamesException
      * @throws InvalidColumnException
      * @throws InvalidTableException
      */
-    public function insert(string $table, array $rows, bool $updateOnDuplicate = true): int|bool
+    public function insert(string $table, array $rows, bool $updateOnDuplicate = true): int|false
     {
         /**
          * TODO: A note for myself: I could take out the MismatchedColumnNamesException if I pre-loaded the default
@@ -950,10 +952,10 @@ class Nestbox
      * @param int $start
      * @param int $limit
      * @param array $orderBy
-     * @return array|bool
+     * @return array
      */
     public function select(string $table, array $where = [], string $conjunction = "AND", int $start = 0,
-                           int    $limit = 0, array $orderBy = []): array|bool
+                           int    $limit = 0, array $orderBy = []): array
     {
         if (!$this->valid_schema($table)) throw new InvalidTableException(table: $table);
 
@@ -967,7 +969,7 @@ class Nestbox
         $orderByClause = [];
         foreach ($orderBy as $column => $order) {
             if (!$this->valid_schema($table, $column)) throw new InvalidColumnException(table: $table, column: $column);
-            $orderByClause[] = $column . " " . $this::validate_order($order);
+            $orderByClause[] = "`$column`" . " " . $this::validate_order($order);
         }
         $orderByClause = ($orderByClause) ? "ORDER BY " . implode(", ", $orderByClause) : "";
 
@@ -975,9 +977,7 @@ class Nestbox
         $limitClause = static::generate_limit_clause($start, $limit);
 
         // execute and get results
-        if (!$this->query_execute("$selectClause $whereClause $orderByClause $limitClause;", $params)) {
-            return false;
-        }
+        if (!$this->query_execute("$selectClause $whereClause $orderByClause $limitClause;", $params)) return [];
         return $this->fetch_all_results();
     }
 
