@@ -235,8 +235,6 @@ class Nestbox
      */
     protected function create_document_root_relative_directory(string|array $path, int $permissions): bool
     {
-        var_dump("create_document_root_relative_directory $path");
-
         $path = $this->generate_document_root_relative_path($path);
 
         if (!file_exists($path))
@@ -1899,7 +1897,6 @@ class Nestbox
         foreach ($input as $table => $data) {
             try {
                 $updateCount += $this->load_table(table: $table, data: $data, truncate: $truncate);
-                var_dump("load_database().updateCount: $updateCount");
             } catch (EmptyParamsException $e) {
                 $errors[] = $e->getMessage();
             }
@@ -1933,7 +1930,7 @@ class Nestbox
         $json = (is_array($json)) ? json_encode(value: $json, flags: JSON_PRETTY_PRINT) : $json;
         $fullPath = [
             static::NESTBOX_INGEST_DIRECTORY,
-            microtime(as_float: true) ."-". hash(algo: "sha256", data: $json) . ".json"
+            microtime(as_float: true) . "-" . hash(algo: "sha256", data: $json) . ".json"
         ];
         $fullPath = $this->generate_document_root_relative_path($fullPath);
         return file_put_contents($fullPath, $json);
@@ -1990,17 +1987,13 @@ class Nestbox
             foreach ($json as $table => $rows) {
                 // calculate seconds per row
                 $rowsPerSecond = (0 < $stats["rows_ingested"]) ? $stats["rows_ingested"] / $this->timer() : 0;
-                var_dump("rowsPerSecond: $rowsPerSecond");
-                var_dump("stats[\"rows_ingested\"]: {$stats["rows_ingested"]}");
-                var_dump("this->timer(): {$this->timer()}");
 
                 // get row count
                 $rowCount = count($rows);
 
                 // estimate time of insert
                 $estimatedSecondsForNextInsert = ($rowsPerSecond)
-                    ? $rowCount / $rowsPerSecond : $this->nestboxMaxIngestProcessingSeconds / 2 ;
-                var_dump("estimatedSecondsForNextInsert $estimatedSecondsForNextInsert");
+                    ? $rowCount / $rowsPerSecond : $this->nestboxMaxIngestProcessingSeconds / 2;
 
                 // return if estimate is over script timeout
                 if ($this->nestboxMaxIngestProcessingSeconds < $this->timer() + $estimatedSecondsForNextInsert) {
@@ -2008,7 +2001,6 @@ class Nestbox
                         $stats["remaining_file_count"] = $this->get_ingest_queue_count();
                         $_SESSION["nestbox_ingest"] = $stats;
                     }
-                    var_dump("will take too long" . ($this->timer() + $estimatedSecondsForNextInsert));
                     return;
                 }
 
@@ -2090,5 +2082,57 @@ class Nestbox
         }
 
         return false;
+    }
+
+    /**
+     * Utility
+     */
+
+
+    /**
+     * Takes `$input` of a given case, then returns a converted string of `"camelCase"`, `"CONSTANT_CASE"`,
+     * `"kebab-case"`, `"PascalCase"`, `"snake_case"`, or `"Title Case"` based on `$convertTo`, otherwise returns a
+     * trimmed `$input` if it is not a valid case type or `$convertTo` is not a valid case type (`"camel"`,
+     * `"constant"`, `"kebab"`, `"pascal"`, `"snake"`, `"title"`)
+     *
+     * @param string $input
+     * @param string $convertTo
+     * @return string
+     */
+    public static function case_to_case(string $input, string $convertTo): string
+    {
+        $input = trim($input);
+
+        if (!in_array($convertTo, ["camel", "constant", "kebab", "pascal", "snake", "title"])) return $input;
+
+        $parts = preg_split(pattern: '/(?<=[a-z])(?=[A-Z0-9])|(?<=[0-9])(?=[A-Za-z])/', subject: $input); // camel/pascal
+        if ($parts[0] == $input) $parts = preg_split(pattern: '/_+/', subject: $input); // snake/constant
+        if ($parts[0] == $input) $parts = preg_split(pattern: '/-+/', subject: $input); // kebab
+        if ($parts[0] == $input) $parts = preg_split(pattern: '/\s+/', subject: $input); // title
+        if ($parts[0] == $input) return $input; // unknown
+
+        var_dump($parts);
+
+        return match ($convertTo) {
+            "camel" => lcfirst(string: implode(
+                array: array_map(
+                    callback: 'ucfirst', array: array_map(
+                    callback: 'strtolower', array: $parts)
+                )
+            )
+            ),
+            "constant" => strtoupper(string: implode(separator: "_", array: $parts)),
+            "kebab" => strtolower(string: implode(separator: "-", array: $parts)),
+            "pascal" => ucfirst(string: implode(
+                array: array_map(
+                    callback: 'ucfirst', array: array_map(
+                    callback: 'strtolower', array: $parts)
+                )
+            )
+            ),
+            "snake" => strtolower(string: implode(separator: "_", array: $parts)),
+            "title" => ucwords(string: implode(separator: " ", array: $parts)),
+            default => $input
+        };
     }
 }
