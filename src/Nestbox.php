@@ -42,6 +42,11 @@ class Nestbox
     public const NESTBOX_SETTINGS_TABLE = 'nestbox_settings';
     public const NESTBOX_ERROR_TABLE = 'nestbox_errors';
     final protected const NESTBOX_DIRECTORY = "../nestbox";
+    final protected const NESTBOX_INGEST_DIRECTORY = "../nestbox/ingest";
+
+    public bool $nestboxSaveIngestStatsToSession = true;
+    public bool $nestboxAutoProcessIngestDirectory = true;
+    public int $nestboxMaxIngestProcessingSeconds = 60;
 
     // connection properties
     protected string $host = 'localhost';
@@ -75,6 +80,7 @@ class Nestbox
     {
         // start session if unstarted
         if (PHP_SESSION_ACTIVE !== session_status()) session_start();
+        $this->timer();
 
         // define new constants for future calls
         if ($host && !defined('NESTBOX_DB_HOST')) define('NESTBOX_DB_HOST', $host);
@@ -94,12 +100,14 @@ class Nestbox
         $this->pass = ($pass) ?: NESTBOX_DB_PASS;
         $this->name = ($name) ?: NESTBOX_DB_NAME;
 
-
         // make sure class tables have been created
         $this->check_class_tables();
 
         // load settings
         $this->load_settings();
+
+        // process ingest queue
+        if ($this->nestboxAutoProcessIngestDirectory) $this->process_ingest_queue();
     }
 
 
@@ -178,6 +186,25 @@ class Nestbox
     }
 
 
+    public function relative_directory_exists(string|array $path): bool
+    {
+        return file_exists($this->generate_document_root_relative_path($path));
+    }
+
+
+    public function rectify_path_slashes(string|array $path): string
+    {
+        return trim(
+            string: preg_replace(
+                pattern: '#[/\\\\]+#',
+                replacement: DIRECTORY_SEPARATOR,
+                subject: (is_array($path)) ? implode(separator: DIRECTORY_SEPARATOR, array: $path) : $path
+            ),
+            characters: DIRECTORY_SEPARATOR
+        );
+    }
+
+
     /**
      * Takes a string or array of folder names, verifies path separators, validates the provided path relative to the
      * `$_SERVER["DOCUMENT_ROOT"]` directory by prepending it if it isn't already present, then finally returns the
@@ -188,15 +215,13 @@ class Nestbox
      */
     protected function generate_document_root_relative_path(string|array $path): string
     {
-        $path = (is_array($path)) ? implode(separator: DIRECTORY_SEPARATOR, array: $path) : $path;
+        $path = $this->rectify_path_slashes($path);
+        $documentRoot = $this->rectify_path_slashes($_SERVER["DOCUMENT_ROOT"]);
 
-        $path = (!str_contains(haystack: $path, needle: $_SERVER["DOCUMENT_ROOT"]))
-            ? implode("/", [$_SERVER["DOCUMENT_ROOT"], $path]) : $path;
+        $path = (!str_starts_with(haystack: $path, needle: $documentRoot))
+            ? implode(DIRECTORY_SEPARATOR, [$documentRoot, $path]) : $path;
 
-        return trim(
-            string: preg_replace(pattern: '#[/\\\\]+#', replacement: DIRECTORY_SEPARATOR, subject: $path),
-            characters: DIRECTORY_SEPARATOR
-        );
+        return trim(string: $path, characters: DIRECTORY_SEPARATOR);
     }
 
 
@@ -210,13 +235,20 @@ class Nestbox
      */
     protected function create_document_root_relative_directory(string|array $path, int $permissions): bool
     {
-        if (is_array($path) or !str_contains(haystack: $path, needle: $_SERVER["DOCUMENT_ROOT"]))
-            $path = $this->generate_document_root_relative_path($path);
+        var_dump("create_document_root_relative_directory $path");
+
+        $path = $this->generate_document_root_relative_path($path);
 
         if (!file_exists($path))
             return mkdir(directory: $path, permissions: $permissions, recursive: true);
 
         return chmod(filename: $path, permissions: $permissions);
+    }
+
+
+    public function create_nestbox_directory(): bool
+    {
+        return $this->create_document_root_relative_directory(static::NESTBOX_DIRECTORY, 0666);
     }
 
 
@@ -629,7 +661,7 @@ class Nestbox
             $clause[] = "`$column` $operator :$column";
             $params[$column] = $value;
         }
-        $conjunction = " ". $this::validate_conjunction($conjunction) ." ";
+        $conjunction = " " . $this::validate_conjunction($conjunction) . " ";
         $clause = ($params) ? "WHERE " . implode($conjunction, $clause) : "";
         return [$clause, $params];
     }
@@ -1249,7 +1281,7 @@ class Nestbox
      * @throws TransactionImplicitCommitNotAllowed
      */
     public function transaction_execute(array $queries, bool $commit = false, bool $rollbackOnFail = true,
-                                        bool $allowImplicitCommits = false): array|false
+                                        bool  $allowImplicitCommits = false): array|false
     {
         $results = [];
 
@@ -1831,9 +1863,22 @@ class Nestbox
 
         if ($truncate) $this->truncate_table($table);
 
-        return $this->insert(table: $table, rows: $data);
+        $rowsUpdated = 0;
+
+        // if more than 3000 rows, row chunk
+        $rowChunks = array_chunk($data, 3500);
+
+        // insert rows
+        foreach ($rowChunks as $chunk) {
+            $rowsUpdated += $this->insert(table: $table, rows: $chunk);
+        }
+
+        return $rowsUpdated;
     }
 
+    /**
+     * Data Ingest
+     */
 
     /**
      * Takes a JSON string of tables and rows, inserts the table data, and returns the number of rows inserted; if
@@ -1854,6 +1899,7 @@ class Nestbox
         foreach ($input as $table => $data) {
             try {
                 $updateCount += $this->load_table(table: $table, data: $data, truncate: $truncate);
+                var_dump("load_database().updateCount: $updateCount");
             } catch (EmptyParamsException $e) {
                 $errors[] = $e->getMessage();
             }
@@ -1862,29 +1908,187 @@ class Nestbox
         return [$updateCount, $errors];
     }
 
-    protected function create_import_queue_directory(): true
+    /**
+     * Creates the ingest directory as defined by `NESTBOX_INGEST_DIRECTORY`
+     *
+     * @return bool
+     */
+    protected function create_ingest_directory(): bool
     {
+        $path = $this->generate_document_root_relative_path(static::NESTBOX_INGEST_DIRECTORY);
+        if (!file_exists($path))
+            return $this->create_document_root_relative_directory($path, 0666);
         return true;
     }
 
-    protected function save_json_in_queue_directory(): true
+    /**
+     * Saves a json string or a serialized array to a json file in the ingest directory
+     *
+     * @param string|array $json
+     * @return int|false
+     */
+    protected function save_json_to_ingest_directory(string|array $json): int|false
     {
-        return true;
+        $this->create_ingest_directory();
+        $json = (is_array($json)) ? json_encode(value: $json, flags: JSON_PRETTY_PRINT) : $json;
+        $fullPath = [
+            static::NESTBOX_INGEST_DIRECTORY,
+            microtime(as_float: true) ."-". hash(algo: "sha256", data: $json) . ".json"
+        ];
+        $fullPath = $this->generate_document_root_relative_path($fullPath);
+        return file_put_contents($fullPath, $json);
     }
 
-    protected function process_queue(): true
+    /**
+     * Loads json files saved in queue directory into an array sorted by oldest modification time first
+     *
+     * @return array
+     */
+    protected function get_ingest_queue_files(): array
     {
+        return glob($this->generate_document_root_relative_path([static::NESTBOX_INGEST_DIRECTORY, "*.json"]));
+    }
+
+    /**
+     * Returns the total count of files in the ingest queue directory
+     *
+     * @return int
+     */
+    protected function get_ingest_queue_count(): int
+    {
+        return count(glob($this->generate_document_root_relative_path([static::NESTBOX_INGEST_DIRECTORY, ".json"])));
+    }
+
+    /**
+     * Processes json files saved in ingest queue directory and ingests the data into the database
+     *
+     * @return void
+     */
+    protected function process_ingest_queue(): void
+    {
+        $stats = [
+            "pending_file_count" => 0,
+            "rows_ingested" => 0,
+            "actual_updates" => 0,
+            "remaining_file_count" => 0,
+            "errors" => []
+        ];
+
         // load queue files
-        // get start time
-        // get script timeout seconds
+        $fileQueue = $this->get_ingest_queue_files();
+        if (!$fileQueue) {
+            if ($this->nestboxSaveIngestStatsToSession) $_SESSION["nestbox_ingest"] = $stats;
+            return;
+        }
+
+        $stats["pending_file_count"] = count($fileQueue);
+
         // loop through files
-        // get table name
-        // calculate seconds per row
-        // get row count
-        // estimate time of insert
-        // return if estimate is over script timeout
-        // if more than 3000 rows, row chunk
-        // insert rows
-        return true;
+        foreach ($fileQueue as $file) {
+            $json = json_decode(file_get_contents(filename: $file), associative: true);
+
+            foreach ($json as $table => $rows) {
+                // calculate seconds per row
+                $rowsPerSecond = (0 < $stats["rows_ingested"]) ? $stats["rows_ingested"] / $this->timer() : 0;
+                var_dump("rowsPerSecond: $rowsPerSecond");
+                var_dump("stats[\"rows_ingested\"]: {$stats["rows_ingested"]}");
+                var_dump("this->timer(): {$this->timer()}");
+
+                // get row count
+                $rowCount = count($rows);
+
+                // estimate time of insert
+                $estimatedSecondsForNextInsert = ($rowsPerSecond)
+                    ? $rowCount / $rowsPerSecond : $this->nestboxMaxIngestProcessingSeconds / 2 ;
+                var_dump("estimatedSecondsForNextInsert $estimatedSecondsForNextInsert");
+
+                // return if estimate is over script timeout
+                if ($this->nestboxMaxIngestProcessingSeconds < $this->timer() + $estimatedSecondsForNextInsert) {
+                    if ($this->nestboxSaveIngestStatsToSession) {
+                        $stats["remaining_file_count"] = $this->get_ingest_queue_count();
+                        $_SESSION["nestbox_ingest"] = $stats;
+                    }
+                    var_dump("will take too long" . ($this->timer() + $estimatedSecondsForNextInsert));
+                    return;
+                }
+
+                list($updatedRows, $errors) = $this->load_database([$table => $rows]);
+                $stats["actual_updates"] += $updatedRows;
+                $stats["rows_ingested"] += $rowCount;
+                $stats["errors"] += $errors;
+            }
+
+            // delete json file upon ingest completion
+            unlink($file);
+        }
+
+        if ($this->nestboxSaveIngestStatsToSession) {
+            $stats["remaining_file_count"] = $this->get_ingest_queue_count();
+            $_SESSION["nestbox_ingest"] = $stats;
+        }
+    }
+
+    /**
+     * Timekeeping
+     *  _____ _                _                   _
+     * |_   _(_)_ __ ___   ___| | _____  ___ _ __ (_)_ __   __ _
+     *   | | | | '_ ` _ \ / _ \ |/ / _ \/ _ \ '_ \| | '_ \ / _` |
+     *   | | | | | | | | |  __/   <  __/  __/ |_) | | | | | (_| |
+     *   |_| |_|_| |_| |_|\___|_|\_\___|\___| .__/|_|_| |_|\__, |
+     *                                      |_|            |___/
+     */
+
+    /**
+     * On first call, defines `NESTBOX_EXECUTION_START` and returns 0.0, then on each successive call returns the number
+     * of seconds and microseconds between now and `NESTBOX_EXECUTION_START`
+     *
+     * @return float
+     */
+    public function timer(): float
+    {
+        if (!defined("NESTBOX_EXECUTION_START")) {
+            define("NESTBOX_EXECUTION_START", microtime(as_float: true));
+            return 0.0;
+        }
+
+        return microtime(as_float: true) - NESTBOX_EXECUTION_START;
+    }
+
+    /**
+     * If provided, adds a key => value pair to an array of checkpoints, where each key is the time since the first call
+     * to timer_checkpoint() or timer() and each value is the checkpoint name, then returns the full array of all
+     * previously saved checkpoints
+     *
+     * @param string|null $checkpointName null
+     * @return array
+     */
+    public function timer_checkpoint(string $checkpointName = null): array
+    {
+        static $checkpoints = [];
+
+        if (empty($checkpoints)) {
+            if (!defined("NESTBOX_EXECUTION_START")) $this->timer();
+            $checkpoints[NESTBOX_EXECUTION_START] = "start";
+        }
+
+        if ($checkpointName) $checkpoints[$this->timer()] = $checkpointName;
+
+        return $checkpoints;
+    }
+
+    /**
+     * Returns the number of microseconds that have elapsed since the first checkpoint of `$checkpointName`, or `false`
+     * if no checkpoint matches the provided name
+     *
+     * @param string $checkpointName
+     * @return float|false
+     */
+    public function time_since_checkpoint(string $checkpointName): float|false
+    {
+        foreach ($this->timer_checkpoint() as $time => $name) {
+            if ($checkpointName == $name) return microtime(as_float: true) - $time;
+        }
+
+        return false;
     }
 }
