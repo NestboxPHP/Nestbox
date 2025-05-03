@@ -47,6 +47,7 @@ class Nestbox
     public bool $nestboxSaveIngestStatsToSession = true;
     public bool $nestboxAutoProcessIngestDirectory = true;
     public int $nestboxMaxIngestProcessingSeconds = 60;
+    public int $nestboxIngestTimeThreshold = 10;
 
     // connection properties
     protected string $host = 'localhost';
@@ -1985,35 +1986,33 @@ class Nestbox
             $json = json_decode(file_get_contents(filename: $file), associative: true);
 
             foreach ($json as $table => $rows) {
-                // calculate seconds per row
-                $rowsPerSecond = (0 < $stats["rows_ingested"]) ? $stats["rows_ingested"] / $this->timer() : 0;
-
-                // get row count
-                $rowCount = count($rows);
-
-                // estimate time of insert
-                $estimatedSecondsForNextInsert = ($rowsPerSecond)
-                    ? $rowCount / $rowsPerSecond : $this->nestboxMaxIngestProcessingSeconds / 2;
-
-                // return if estimate is over script timeout
-                if ($this->nestboxMaxIngestProcessingSeconds < $this->timer() + $estimatedSecondsForNextInsert) {
-                    if ($this->nestboxSaveIngestStatsToSession) {
-                        $stats["remaining_file_count"] = $this->get_ingest_queue_count();
-                        $_SESSION["nestbox_ingest"] = $stats;
+                // have we crossed the timer threshold limit for ingest?
+                if ($this->timer() >= $this->nestboxIngestTimeThreshold) {
+                    // save the current json if it's in the middle of being processed
+                    if (json_decode(file_get_contents(filename: $file), associative: true) != $json) {
+                        unlink(filename: $file);
+                        $this->save_json_to_ingest_directory($json);
                     }
-                    return;
+
+                    // break $json and $fileQueue
+                    break 2;
                 }
 
+                // update stats
                 list($updatedRows, $errors) = $this->load_database([$table => $rows]);
                 $stats["actual_updates"] += $updatedRows;
-                $stats["rows_ingested"] += $rowCount;
+                $stats["rows_ingested"] += count($rows);
                 $stats["errors"] += $errors;
+
+                // table completely ingested, remove from pending list
+                unset($json[$table]);
             }
 
             // delete json file upon ingest completion
-            unlink($file);
+            unlink(filename: $file);
         }
 
+        // save ingest stats
         if ($this->nestboxSaveIngestStatsToSession) {
             $stats["remaining_file_count"] = $this->get_ingest_queue_count();
             $_SESSION["nestbox_ingest"] = $stats;
